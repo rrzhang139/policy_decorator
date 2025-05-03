@@ -28,6 +28,7 @@ from diffusers.training_utils import EMAModel
 from diffusers.optimization import get_scheduler
 from nets.diffusion_policy.conditional_unet1d_colab import ConditionalUnet1D
 
+os.environ["DISPLAY"] = "" 
 
 def parse_args():
     # fmt: off
@@ -247,6 +248,8 @@ class Agent(nn.Module):
 
         # observation as FiLM conditioning
         obs_cond = obs_seq.flatten(start_dim=1) # (B, obs_horizon * obs_dim)
+        dropout_mask = (torch.rand(B, device=device) < 0.1).unsqueeze(1)
+        obs_cond = torch.where(dropout_mask, torch.zeros_like(obs_cond), obs_cond)
 
         # sample noise to add to actions
         noise = torch.randn((B, self.pred_horizon, self.act_dim), device=device)
@@ -279,17 +282,22 @@ class Agent(nn.Module):
         B = obs_seq.shape[0]
         with torch.no_grad():
             obs_cond = obs_seq.flatten(start_dim=1) # (B, obs_horizon * obs_dim)
+            
+            w = 2.0
+            obs_zero = torch.zeros_like(obs_cond)
 
             # initialize action from Guassian noise
             noisy_action_seq = torch.randn((B, self.pred_horizon, self.act_dim), device=obs_seq.device)
 
             for k in self.noise_scheduler.timesteps:
                 # predict noise
-                noise_pred = self.noise_pred_net(
+                eps_u = self.noise_pred_net(noisy_action_seq, k, global_cond=obs_zero)
+                eps_c = self.noise_pred_net(
                     sample=noisy_action_seq,
                     timestep=k,
                     global_cond=obs_cond,
                 )
+                noise_pred = eps_c + w * (eps_c - eps_u)
 
                 # inverse diffusion step (remove noise)
                 noisy_action_seq = self.noise_scheduler.step(
