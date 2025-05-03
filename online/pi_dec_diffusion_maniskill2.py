@@ -6,6 +6,7 @@ import random
 from distutils.util import strtobool
 
 os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["DISPLAY"] = "" 
 
 import gymnasium as gym
 import numpy as np
@@ -101,6 +102,16 @@ def parse_args():
     parser.add_argument("--log-freq", type=int, default=20000)
     parser.add_argument("--save-freq", type=int, default=1_000_000)
     parser.add_argument("--obj-ids", metavar='N', type=str, nargs='+', default=[])
+    
+    parser.add_argument(
+        "--res_start_step", type=int, default=0,
+        help="Environment step index (inclusive) at which the residual starts taking effect."
+    )
+    parser.add_argument(
+        "--res_end_step", type=int, default=1_000_000,
+        help="Environment step index (exclusive) at which the residual stops. "
+            "Set to a very large number to keep residual on for the whole episode."
+    )
 
     args = parser.parse_args()
     args.algo_name = ALGO_NAME
@@ -134,7 +145,7 @@ def make_env(env_id, seed, control_mode=None, video_dir=None, other_kwargs={}):
     def thunk():
         env_kwargs = {'model_ids': other_kwargs['obj_ids']} if len(other_kwargs['obj_ids']) > 0 else {}
         env = gym.make(env_id, reward_mode='sparse', obs_mode='state', control_mode=control_mode,
-                        render_mode='cameras' if video_dir else None, **env_kwargs)
+                        render_mode='rgb_array' if video_dir else None, **env_kwargs)
         if video_dir:
             env = RecordEpisode(env, output_dir=video_dir, save_trajectory=False, info_on_video=True)
         env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -488,6 +499,7 @@ if __name__ == "__main__":
     obs_seq, info = envs.reset(seed=args.seed) # in Gymnasium, seed is given to reset() instead of seed()
     global_step = 0
     global_update = 0
+    ema_v = 0
     learning_has_started = False
     num_updates_per_training = int(args.training_freq * args.utd)
     result = defaultdict(list)
@@ -506,6 +518,13 @@ if __name__ == "__main__":
             base_actions = base_act_seq.reshape(-1, total_act_dim)
             res_ratio = min(global_step / args.prog_explore, 1)
             enable_res_masks = np.random.rand(args.num_envs) < res_ratio
+            
+            # expects the value function to work reasonably (after a few thousand steps)
+            with torch.no_grad():
+                v_curr = torch.min(
+                    qf1(obs_seq_tensor[:, -1], base_actions),
+                    qf2(obs_seq_tensor[:, -1], base_actions)
+                ).mean()     
 
             # ALGO LOGIC: put action logic here
             if not learning_has_started:
@@ -518,8 +537,23 @@ if __name__ == "__main__":
                 res_actions[np.logical_not(enable_res_masks)] = 0.0
 
             res_act_seq = res_actions.reshape(-1, args.act_horizon, act_dim)
+            ep_step = step_in_episodes.squeeze(-1).squeeze(-1)
+            # use_residual_mask = (
+            #     (ep_step >= args.res_start_step) &
+            #     (ep_step <  args.res_end_step)
+            # )
+            
+            ema_v = 0.99 * ema_v + 0.01 * v_curr.item()
+            delta_v = v_curr.item() - ema_v
+            use_residual_mask = delta_v > 0.15
+
+            res_act_seq[~use_residual_mask, ...] = 0.0
+            res_actions[~use_residual_mask, ...] = 0.0
+            # if use_residual_mask:
             scaled_res_seq = args.res_scale * res_act_seq # (B, act_horizon, act_dim)
             final_act_seq = base_act_seq + scaled_res_seq
+            # else:
+            #     final_act_seq = base_act_seq
 
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs_seq, rewards, terminations, truncations, infos = envs.step(final_act_seq)
