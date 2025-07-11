@@ -50,9 +50,9 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Imitation Learning arguments
-    parser.add_argument("--env-id", type=str, default="PegInsertionSide-v2",
+    parser.add_argument("--env-id", type=str, default="PickCube-v1",
         help="the id of the environment")
-    parser.add_argument("--demo-path", type=str, default='data/PegInsertionSide/trajectory.h5',
+    parser.add_argument("--demo-path", type=str, default='data/PickCube-v1/trajectory.h5',
         help="the path of demo dataset (h5)")
     parser.add_argument("--num-demo-traj", type=int, default=None)
     parser.add_argument("--total-iters", type=int, default=1_000_000, # for easier task, we can train shorter
@@ -102,15 +102,17 @@ def parse_args():
                 control_mode = demo_info['episodes'][0]['control_mode']
             else:
                 raise Exception('Control mode not found in json')
+            # print(control_mode)
+            # print(args.control_mode)
             assert control_mode == args.control_mode, 'Control mode mismatched'
     assert args.obs_horizon + args.act_horizon - 1 <= args.pred_horizon
     assert args.obs_horizon >= 1 and args.act_horizon >= 1 and args.pred_horizon >= 1
     # fmt: on
     return args
 
-import mani_skill2.envs
-import envs.maniskill_fixed # register the environments for policy decorator
-from mani_skill2.utils.wrappers import RecordEpisode
+import mani_skill.envs
+# import envs.maniskill_fixed # register the environments for policy decorator
+from mani_skill.utils.wrappers import RecordEpisode
 
 class SeqActionWrapper(gym.Wrapper):
     def step(self, action_seq):
@@ -125,8 +127,12 @@ class SeqActionWrapper(gym.Wrapper):
 def make_env(env_id, seed, control_mode=None, video_dir=None, other_kwargs={}):
     def thunk():
         env_kwargs = {'model_ids': other_kwargs['obj_ids']} if len(other_kwargs['obj_ids']) > 0 else {}
-        env = gym.make(env_id, reward_mode='sparse', obs_mode='state', control_mode=control_mode,
-                        render_mode='cameras' if video_dir else None, **env_kwargs)
+        env = gym.make(env_id, 
+                    #   reward_mode='sparse', 
+                      obs_mode='state', 
+                      control_mode=control_mode,
+                      render_mode='cameras' if video_dir else None, 
+                      **env_kwargs)
         if video_dir:
             env = RecordEpisode(env, output_dir=video_dir, save_trajectory=False, info_on_video=True)
         
@@ -143,7 +149,7 @@ def make_env(env_id, seed, control_mode=None, video_dir=None, other_kwargs={}):
 
 class SmallDemoDataset_DiffusionPolicy(Dataset): # Load everything into GPU memory
     def __init__(self, data_path, device, num_traj):
-        from utils.ms2_data import load_demo_dataset
+        from utils.ms3_data import load_demo_dataset
         trajectories = load_demo_dataset(data_path, num_traj=num_traj, concat=False)
         # trajectories['observations'] is a list of np.ndarray (L+1, obs_dim)
         # trajectories['actions'] is a list of np.ndarray (L, act_dim)

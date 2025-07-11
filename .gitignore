@@ -57,3 +57,6 @@ debug/
 figures/
 data/
 checkpoints/
+
+**/eval_videos
+**/*.mp4

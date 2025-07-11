@@ -38,12 +38,14 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="policy_decorator",
+    parser.add_argument("--wandb-project-name", type=str, default="diffusion_steering",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
     parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="whether to capture videos of the agent performances (check out `videos` folder)")
+    parser.add_argument("--video-freq", type=int, default=8,
+        help="record videos every N evaluations")
 
     # SAC arguments
     parser.add_argument("--env-id", type=str, default="PegInsertionSide-v2",
@@ -75,16 +77,19 @@ def parse_args():
         help="automatic tuning of the entropy coefficient")
     parser.add_argument("--max-grad-norm", type=float, default=50,
         help="the maximum norm for the gradient clipping")
-    parser.add_argument("--utd", type=float, default=0.25,
+    parser.add_argument("--utd", type=float, default=20.0,
         help="Update-to-Data ratio (number of gradient updates / number of env steps)")
     parser.add_argument("--training-freq", type=int, default=64)
     parser.add_argument("--bootstrap-at-done", type=str, choices=['always', 'never', 'truncated'], default='truncated',
         help="in ManiSkill variable episode length and dense reward setting, set to always if positive reawrd, truncated if negative reward; in sparse reward setting, any of them should be fine")
+    
+    # DSRL arguments
+    parser.add_argument("--action_magnitude", type=int, default=2, help="action magnitude for DSRL")
 
     # Policy Decorator arguments
     parser.add_argument("--res-scale", type=float, default=0.1) # alpha, need to tune
     parser.add_argument("--prog-explore", type=int, default=100_000) # H, need to tune
-    parser.add_argument("--critic-input", type=str, choices=['res', 'sum', 'concat'], default='sum')
+    parser.add_argument("--critic-input", type=str, choices=['res', 'sum', 'concat', 'noise'], default='noise')
     parser.add_argument("--actor-input", type=str, choices=['obs', 'obs_base_action'], default='obs')
     parser.add_argument("--log-std-min", type=float, default=-20)
 
@@ -103,6 +108,7 @@ def parse_args():
     parser.add_argument("--save-freq", type=int, default=1_000_000)
     parser.add_argument("--obj-ids", metavar='N', type=str, nargs='+', default=[])
     
+
     args = parser.parse_args()
     args.algo_name = ALGO_NAME
     args.script = __file__
@@ -205,14 +211,19 @@ class BasePolicy(nn.Module):
 
         return F.mse_loss(noise_pred, noise)
     
-    def get_action(self, obs_seq):
+    def get_action(self, obs_seq, noise_latent = None):
         # obs_seq: (B, obs_horizon, obs_dim)
         B = obs_seq.shape[0]
         with torch.no_grad():
             obs_cond = obs_seq.flatten(start_dim=1) # (B, obs_horizon * obs_dim)
 
             # initialize action from Guassian noise
-            noisy_action_seq = torch.randn((B, self.pred_horizon, self.act_dim), device=obs_seq.device)
+            if noise_latent is None:
+                noisy_action_seq = torch.randn((B, self.pred_horizon, self.act_dim), device=obs_seq.device)
+            else:
+                noisy_action_seq = torch.tensor(noise_latent, device=obs_seq.device, dtype=torch.float32)
+                
+            # noisy_action_seq = (noise_mu + noise_std * torch.randn((B, self.pred_horizon, self.act_dim), device=obs_seq.device))
             # print(obs_cond.cpu().numpy()); exit()
             # print(list(self.noise_pred_net.parameters())[-1].cpu().numpy()); exit()
 
@@ -247,11 +258,13 @@ class SoftQNetwork(nn.Module):
     def __init__(self, env):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape), 256),
+            nn.Linear(np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape), 1024),
+            nn.LayerNorm(1024),
             nn.ReLU(),
-            nn.Linear(256, 256),
+            nn.Linear(1024, 1024),
+            nn.LayerNorm(1024),
             nn.ReLU(),
-            nn.Linear(256, 256),
+            nn.Linear(1024, 256),
             nn.ReLU(),
             layer_init(nn.Linear(256, 1), std=0.01),
         )
@@ -271,20 +284,23 @@ class Actor(nn.Module):
         obs_dim = np.array(env.single_observation_space.shape).prod()
         input_dim = obs_dim if args.actor_input == 'obs' else obs_dim + np.prod(env.single_action_space.shape)
         self.backbone = nn.Sequential(
-            nn.Linear(input_dim, 256),
+            nn.Linear(input_dim, 1024),
+            nn.LayerNorm(1024),
             nn.ReLU(),
-            nn.Linear(256, 256),
+            nn.Linear(1024, 1024),
+            nn.LayerNorm(1024),
             nn.ReLU(),
-            nn.Linear(256, 256),
+            nn.Linear(1024, 1024),
             nn.ReLU(),
         )
-        self.fc_mean = layer_init(nn.Linear(256, np.prod(env.single_action_space.shape)), std=0.01)
-        self.fc_logstd = layer_init(nn.Linear(256, np.prod(env.single_action_space.shape)), std=0.01)
+        self.fc_mean = layer_init(nn.Linear(1024, np.prod(env.single_action_space.shape)), std=0.01)
+        self.fc_logstd = layer_init(nn.Linear(1024, np.prod(env.single_action_space.shape)), std=0.01)
+        self.b_W = args.action_magnitude
 
         # action rescaling
-        h, l = env.single_action_space.high, env.single_action_space.low
-        self.register_buffer("action_scale", torch.tensor((h - l) / 2.0, dtype=torch.float32))
-        self.register_buffer("action_bias", torch.tensor((h + l) / 2.0, dtype=torch.float32))
+        # h, l = env.single_action_space.high, env.single_action_space.low
+        # self.register_buffer("action_scale", torch.tensor((h - l) / 2.0, dtype=torch.float32))
+        # self.register_buffer("action_bias", torch.tensor((h + l) / 2.0, dtype=torch.float32))
         # will be saved in the state_dict
 
     def forward(self, x):
@@ -299,26 +315,24 @@ class Actor(nn.Module):
     def get_eval_action(self, x):
         x = self.backbone(x)
         mean = self.fc_mean(x)
-        action = torch.tanh(mean) * self.action_scale + self.action_bias
+        action = torch.tanh(mean) * self.b_W
         return action
 
     def get_action(self, x):
         mean, log_std = self(x)
         std = log_std.exp()
         normal = torch.distributions.Normal(mean, std)
-        x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
-        y_t = torch.tanh(x_t)
-        action = y_t * self.action_scale + self.action_bias
-        log_prob = normal.log_prob(x_t)
+        w = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
+        w0 = torch.tanh(w)
+        action = w0 * self.b_W
+        log_prob = normal.log_prob(w)
         # Enforcing Action Bound
-        log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
+        log_prob -= torch.log(self.b_W * (1 - w0.pow(2)) + 1e-6)
         log_prob = log_prob.sum(1, keepdim=True)
-        mean = torch.tanh(mean) * self.action_scale + self.action_bias
+        mean = torch.tanh(mean) * self.b_W
         return action, log_prob, mean
 
     def to(self, device):
-        self.action_scale = self.action_scale.to(device)
-        self.action_bias = self.action_bias.to(device)
         return super().to(device)
 
 
@@ -344,13 +358,13 @@ def evaluate(n, base_policy, res_actor, eval_envs, device):
     while len(result['return']) < n:
         obs_seq_tensor = torch.Tensor(obs_seq).to(device)
         with torch.no_grad():
-            base_act_seq_tensor = base_policy.get_eval_action(obs_seq_tensor).detach()
-            base_act_seq = base_act_seq_tensor.cpu().numpy()
             actor_input = obs_seq_tensor[:, -1] if args.actor_input == 'obs' else torch.cat([obs_seq_tensor[:, -1], base_act_seq_tensor.reshape(-1, total_act_dim)], dim=1)
-            res_actions = res_actor.get_eval_action(actor_input).detach().cpu().numpy()
-        res_act_seq = res_actions.reshape(-1, args.act_horizon, act_dim)
-        scaled_res_seq = args.res_scale * res_act_seq
-        final_act_seq = base_act_seq + scaled_res_seq
+            noise_latent = res_actor.get_eval_action(actor_input).detach().cpu().numpy()
+            base_act_seq_tensor = base_policy.get_eval_action(obs_seq_tensor, noise_latent).detach()
+            base_act_seq = base_act_seq_tensor.cpu().numpy()
+        # res_act_seq = res_actions.reshape(-1, args.act_horizon, act_dim)
+        # scaled_res_seq = args.res_scale * res_act_seq
+        final_act_seq = base_act_seq #+ scaled_res_seq
         obs_seq, rew, terminated, truncated, info = eval_envs.step(final_act_seq)
         collect_episode_info(info, result)
     print('======= Evaluation Ends =========')
@@ -414,15 +428,16 @@ if __name__ == "__main__":
         [make_env(args.env_id, args.seed + i, args.control_mode, other_kwargs=args.__dict__)
         for i in range(args.num_envs)]
     )
-    VecEnv = gym.vector.SyncVectorEnv if args.sync_venv or args.num_eval_envs == 1 \
+    EvalVecEnv = gym.vector.SyncVectorEnv if args.sync_venv or args.num_eval_envs == 1 \
         else lambda x: gym.vector.AsyncVectorEnv(x, context='forkserver')
     eval_envs = VecEnv(
         [make_env(args.env_id, args.seed + 1000 + i, args.control_mode,
-                f'{log_path}/videos' if args.capture_video and i == 0 else None,
                 other_kwargs=args.__dict__,
                 )
         for i in range(args.num_eval_envs)]
     )
+    
+    eval_count = 0
     eval_envs.reset(seed=args.seed+1000) # seed eval_envs here, and no more seeding during evaluation
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
     assert len(envs.single_observation_space.shape) == 2 # (obs_horizon, obs_dim)
@@ -479,7 +494,7 @@ if __name__ == "__main__":
     rb = ReplayBuffer(
         args.buffer_size,
         dummy_env.single_observation_space,
-        dummy_env.single_action_space if args.critic_input == 'res' and args.actor_input == 'obs' else gym.spaces.Box(low=-np.inf, high=np.inf, shape=(total_act_dim * 3,)),
+        dummy_env.single_action_space, #if args.critic_input == 'res' and args.actor_input == 'obs' else gym.spaces.Box(low=-np.inf, high=np.inf, shape=(total_act_dim * 3,)),
         device,
         n_envs=args.num_envs,
         handle_timeout_termination=False, # stable-baselines3 has not fully supported Gymnasium's termination signal
@@ -501,29 +516,29 @@ if __name__ == "__main__":
         # Collect samples from environemnts
         for local_step in range(args.training_freq // args.num_envs):
             global_step += 1 * args.num_envs
-
-            obs_seq_tensor = torch.Tensor(obs_seq).to(device)
-            base_act_seq_tensor = base_policy.get_eval_action(obs_seq_tensor)
-            base_act_seq = base_act_seq_tensor.cpu().numpy() # (B, act_horizon, act_dim)
-            base_actions = base_act_seq.reshape(-1, total_act_dim)
-            res_ratio = min(global_step / args.prog_explore, 1)
-            enable_res_masks = np.random.rand(args.num_envs) < res_ratio
             
             # ALGO LOGIC: put action logic here
+            res_ratio = min(global_step / args.prog_explore, 1)
+            enable_res_masks = np.random.rand(args.num_envs) < res_ratio
             if not learning_has_started:
-                res_actions = np.array([dummy_env.single_action_space.sample() for _ in range(envs.num_envs)]) # (B, act_horizon*act_dim)
-                res_actions[np.logical_not(enable_res_masks)] = 0.0
+                noise_action = np.array([dummy_env.single_action_space.sample() for _ in range(envs.num_envs)]) # (B, act_horizon*act_dim)
+                noise_action[np.logical_not(enable_res_masks)] = 0.0
             else:
                 actor_input = obs_seq_tensor[:, -1] if args.actor_input == 'obs' else torch.cat([obs_seq_tensor[:, -1], base_act_seq_tensor.flatten(start_dim=1)], dim=1)
-                res_actions, _, _ = res_actor.get_action(actor_input)
-                res_actions = res_actions.detach().cpu().numpy() # (B, act_horizon*act_dim)
-                res_actions[np.logical_not(enable_res_masks)] = 0.0
+                noise_action, _, _ = res_actor.get_action(actor_input)
+                noise_action = noise_action.detach().cpu().numpy() # (B, act_horizon*act_dim)
+                noise_action[np.logical_not(enable_res_masks)] = 0.0
+            noise_action_seq = noise_action.reshape(-1, args.act_horizon, act_dim)
 
-            res_act_seq = res_actions.reshape(-1, args.act_horizon, act_dim)
+            obs_seq_tensor = torch.Tensor(obs_seq).to(device)
+            base_act_seq_tensor = base_policy.get_eval_action(obs_seq_tensor, noise_action_seq)
+            base_act_seq = base_act_seq_tensor.cpu().numpy() # (B, act_horizon, act_dim)
+            base_actions = base_act_seq.reshape(-1, total_act_dim)
+
             ep_step = step_in_episodes.squeeze(-1).squeeze(-1)
 
-            scaled_res_seq = args.res_scale * res_act_seq # (B, act_horizon, act_dim)
-            final_act_seq = base_act_seq + scaled_res_seq
+            # scaled_res_seq = args.res_scale * res_act_seq # (B, act_horizon, act_dim)
+            final_act_seq = base_act_seq #+ scaled_res_seq
 
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs_seq, rewards, terminations, truncations, infos = envs.step(final_act_seq)
@@ -547,14 +562,14 @@ if __name__ == "__main__":
                     if _need_final_obs:
                         real_next_obs_seq[idx] = infos["final_observation"][idx]
 
-            if args.critic_input == 'res' and args.actor_input == 'obs':
-                actions_to_save = res_actions
-            else: # sum or concat both need base actions for s and s'
-                base_next_act_seq = base_policy.get_eval_action(torch.Tensor(real_next_obs_seq).to(device)).cpu().numpy()
-                base_next_actions = base_next_act_seq.reshape(-1, total_act_dim)
-                actions_to_save = np.concatenate([res_actions, base_actions, base_next_actions], axis=1)
-            
-            rb.add(obs_seq[:, -1], real_next_obs_seq[:, -1], actions_to_save, rewards, stop_bootstrap, infos)
+            # if args.critic_input == 'res' and args.actor_input == 'obs':
+            #     actions_to_save = res_actions
+            # else: # sum or concat both need base actions for s and s'
+            #     base_next_act_seq = base_policy.get_eval_action(torch.Tensor(real_next_obs_seq).to(device)).cpu().numpy()
+            #     base_next_actions = base_next_act_seq.reshape(-1, total_act_dim)
+            #     actions_to_save = np.concatenate([res_actions, base_actions, base_next_actions], axis=1)
+            noise_action = noise_action.reshape(args.num_envs, -1)
+            rb.add(obs_seq[:, -1], real_next_obs_seq[:, -1], noise_action, rewards, stop_bootstrap, infos)
 
             step_in_episodes += args.act_horizon
             step_in_episodes[terminations | truncations] = 0
@@ -587,14 +602,14 @@ if __name__ == "__main__":
             # update the value networks
             with torch.no_grad():
                 actor_input = data.next_observations if args.actor_input == 'obs' else torch.cat([data.next_observations, base_next_actions], dim=1)
-                next_state_res_actions, next_state_log_pi, _ = res_actor.get_action(actor_input)
-                if args.critic_input == 'res':
-                    next_state_actions = next_state_res_actions
-                elif args.critic_input == 'sum':
-                    scaled_res_actions = args.res_scale * next_state_res_actions
-                    next_state_actions = base_next_actions + scaled_res_actions
-                else: # concat
-                    next_state_actions = torch.cat([next_state_res_actions, base_next_actions], dim=1)
+                next_state_actions, next_state_log_pi, _ = res_actor.get_action(actor_input)
+                # if args.critic_input == 'res':
+                #     next_state_actions = next_state_actions
+                # elif args.critic_input == 'sum':
+                #     scaled_res_actions = args.res_scale * next_state_actions
+                #     next_state_actions = base_next_actions + scaled_res_actions
+                # else: # concat
+                #     next_state_actions = torch.cat([next_state_actions, base_next_actions], dim=1)
                 qf1_next_target = qf1_target(data.next_observations, next_state_actions)
                 qf2_next_target = qf2_target(data.next_observations, next_state_actions)
                 min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - sac_alpha * next_state_log_pi
@@ -623,14 +638,14 @@ if __name__ == "__main__":
             # update the policy network
             if global_update % args.policy_frequency == 0:  # TD 3 Delayed update support
                 actor_input = data.observations if args.actor_input == 'obs' else torch.cat([data.observations, base_actions], dim=1)
-                res_pi, log_pi, _ = res_actor.get_action(actor_input)
-                if args.critic_input == 'res':
-                    pi = res_pi
-                elif args.critic_input == 'sum':
-                    scaled_res_actions = args.res_scale * res_pi
-                    pi = base_actions + scaled_res_actions
-                else: # concat
-                    pi = torch.cat([res_pi, base_actions], dim=1)
+                pi, log_pi, _ = res_actor.get_action(actor_input)
+                # if args.critic_input == 'res':
+                #     pi = res_pi
+                # elif args.critic_input == 'sum':
+                #     scaled_res_actions = args.res_scale * res_pi
+                #     pi = base_actions + scaled_res_actions
+                # else: # concat
+                #     pi = torch.cat([res_pi, base_actions], dim=1)
                 qf1_pi = qf1(data.observations, pi)
                 qf2_pi = qf2(data.observations, pi)
                 min_qf_pi = torch.min(qf1_pi, qf2_pi)
@@ -684,7 +699,25 @@ if __name__ == "__main__":
 
         # Evaluation
         if (global_step - args.training_freq) // args.eval_freq < global_step // args.eval_freq:
-            result = evaluate(args.num_eval_episodes, base_policy, res_actor, eval_envs, device)
+            eval_count += 1
+            should_record_video = args.capture_video and (eval_count % args.video_freq == 0)
+            
+            if should_record_video:
+                print(f"Recording video for evaluation #{eval_count}")
+                # Create temporary video environments
+                video_envs = EvalVecEnv(
+                    [make_env(args.env_id, args.seed + 1000 + i, args.control_mode,
+                            f'{log_path}/videos' if i == 0 else None,
+                            other_kwargs=args.__dict__,
+                            )
+                    for i in range(args.num_eval_envs)]
+                )
+                video_envs.reset(seed=args.seed+1000)
+                result = evaluate(args.num_eval_episodes, base_policy, res_actor, video_envs, device)
+                video_envs.close()
+            else:
+                result = evaluate(args.num_eval_episodes, base_policy, res_actor, eval_envs, device)
+            
             for k, v in result.items():
                 writer.add_scalar(f"eval/{k}", np.mean(v), global_step)
             timer.end('eval')
